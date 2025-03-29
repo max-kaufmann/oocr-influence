@@ -9,18 +9,17 @@ from transformers import (
     GPT2LMHeadModel,
 )
 import numpy as np
-from typing import Literal
+from typing import Literal, Callable
 import math
 from oocr_influence.datasets.utils import get_data_collator_with_padding
 import torch
 from torch.optim import AdamW, Optimizer
 from oocr_influence.eval import (
     eval_accuracy_and_loss,
-    calculate_accuracies,
     EvaluationFunction,
 )
+import torch.nn.functional as F
 from pathlib import Path
-from torch.amp import autocast  # type: ignore
 from tqdm import tqdm
 import time
 from logging import getLogger
@@ -41,6 +40,7 @@ def train(
     epochs_per_eval: float | None = None,
     steps_per_eval: int | None = None,
     batch_size: int = 512,
+    per_device_batch_size: int | None = None,
     steps_per_save: int | None = None,
     eval_first_step: bool = True,
     weight_decay: float = 0.1,
@@ -48,49 +48,58 @@ def train(
     optimizer: Optimizer | None = None,
     learning_rate: float = 5e-4,
     num_workers: int = 4,
+    save_final_checkpoint: bool = True,
     num_warmup_steps: int | None = None,
     warmup_proportion: float | None = None,
     extra_eval_functions: list[EvaluationFunction] | None = None,
     prefetch_factor: int = 10,
-    gradient_norm: float | None = None,
-    float_type: Literal["bf16", "fp32"] = "bf16",
+    max_grad_norm: float | None = None,
     lr_scheduler: Literal["linear", "linear_warmdown"] = "linear",
+    gradient_checkpointing: bool = False,
+    data_collator: Callable[..., Any] | None = None,
 ):
+    if per_device_batch_size is not None:
+        assert batch_size % per_device_batch_size == 0, (
+            "batch_size must be divisible by per_device_batch_size, as otherwise gradient accumulation can't do a full parameter update"
+        )
+    else:
+        per_device_batch_size = batch_size
+
     train_dataloader = DataLoader(
         dataset=cast(TorchDataset[Any], train_dataset),
         batch_size=batch_size,
         shuffle=True,
-        collate_fn=get_data_collator_with_padding(tokenizer=tokenizer),
+        collate_fn=data_collator or get_data_collator_with_padding(tokenizer=tokenizer),
         pin_memory=True,
         num_workers=num_workers,
+        drop_last=True,
         prefetch_factor=prefetch_factor,
     )
-    model.to(torch.bfloat16 if float_type == "bf16" else torch.float32)  # type: ignore
+    gradient_accumulation_steps = batch_size // per_device_batch_size
 
     parameter_groups = get_parameter_groups(model=model, weight_decay=weight_decay)
-
     optimizer = optimizer or AdamW(params=parameter_groups, lr=learning_rate)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    steps_per_epoch = len(train_dataloader)
 
     assert epochs_per_eval is None or steps_per_eval is None, (
         "Only one of num_epochs_per_eval and num_batches_per_eval can be set."
     )
-    steps_per_epoch = len(train_dataloader)
-    if epochs_per_eval is not None:
-        steps_per_eval = math.ceil(epochs_per_eval * steps_per_epoch)
+    if steps_per_eval is None and epochs_per_eval is not None:
+        steps_per_eval = math.ceil(epochs_per_eval * steps_per_epoch)  # type: ignore
 
     assert max_steps is None or epochs is None, (
         "Only one of num_steps and epochs can be set."
     )
-    if max_steps is None:
-        max_steps = math.ceil(epochs * steps_per_epoch)  # type: ignore
+    max_steps = max_steps or math.ceil(epochs * steps_per_epoch)  # type: ignore
+
+    if steps_per_save is None and epochs_per_save is not None:
+        steps_per_save = math.ceil(epochs_per_save * steps_per_epoch)  # type: ignore
 
     assert num_warmup_steps is not None or warmup_proportion is not None, (
         "Either num_warmup_steps or warmup_proportion must be set"
     )
-    if num_warmup_steps is None:
-        num_warmup_steps = math.ceil(max_steps * warmup_proportion)  # type: ignore
+    num_warmup_steps = num_warmup_steps or math.ceil(max_steps * warmup_proportion)  # type: ignore
 
     scheduler = LambdaLR(
         optimizer,
@@ -101,24 +110,26 @@ def train(
         ),
     )
 
-    assert steps_per_save is None or epochs_per_save is None, (
-        "Only one of steps_per_save and epochs_per_save can be set."
-    )
-    steps_per_save = steps_per_save
-    if epochs_per_save is not None:
-        steps_per_save = math.ceil(epochs_per_save * steps_per_epoch)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     model.train()
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
 
     step_num = 0
     epoch_num = 0
+    optimizer.zero_grad()
 
     while step_num < max_steps:
         epoch_num += 1
         train_losses = []
 
-        for _, batch in tqdm(enumerate(train_dataloader)):
-            log_dict = {"epoch_num": epoch_num, "step_num": step_num}
+        for batch in tqdm(train_dataloader, desc=f"Training Epoch {epoch_num}"):
             step_num += 1
+            log_dict = {"epoch_num": step_num // steps_per_epoch, "step_num": step_num}
+
             eval_this_step = (
                 steps_per_eval is not None and step_num % steps_per_eval == 0
             )
@@ -129,39 +140,42 @@ def train(
             if eval_first_step and step_num == 1:
                 eval_this_step = True
 
-            input_ids, attention_mask, labels = (
-                batch["input_ids"],
-                batch["attention_mask"],
-                batch["labels"],
-            )
+            train_loss = 0
 
-            input_ids, attention_mask, labels = (
-                input_ids.to(device, non_blocking=False),
-                attention_mask.to(device, non_blocking=False),
-                labels.to(device, non_blocking=False),
+            input_ids: torch.Tensor = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask: torch.Tensor = batch["attention_mask"].to(
+                device, non_blocking=True
             )
+            labels: torch.Tensor = batch["labels"].to(device, non_blocking=True)
 
-            input_ids, attention_mask, labels = (
-                cast(torch.Tensor, input_ids),
-                cast(torch.Tensor, attention_mask),
-                cast(torch.Tensor, labels),
-            )
+            num_tokens_in_batch = (labels != -100).sum()
 
-            with autocast(
-                device_type=device,
-                enabled=float_type == "bf16",
-                dtype=torch.bfloat16 if float_type == "bf16" else None,
-            ):
-                output = model(
-                    input_ids=input_ids,
-                    labels=labels,
-                    attention_mask=attention_mask,
+            for micro_batch_num in range(gradient_accumulation_steps):
+                microbatch_slice = slice(
+                    micro_batch_num * per_device_batch_size,
+                    (micro_batch_num + 1) * per_device_batch_size,
                 )
 
-            loss, logits = output["loss"], output["logits"]
-            loss, logits = cast(torch.Tensor, loss), cast(torch.Tensor, logits)
+                input_ids_microbatch, attention_mask_microbatch, labels_microbatch = (
+                    input_ids[microbatch_slice],
+                    attention_mask[microbatch_slice],
+                    labels[microbatch_slice],
+                )
 
-            loss.backward()
+                output = model(
+                    input_ids=input_ids_microbatch,
+                    attention_mask=attention_mask_microbatch,
+                )
+
+                logits: torch.Tensor = output["logits"]
+                loss = compute_loss(logits, labels_microbatch, reduction="sum")
+                loss = loss / num_tokens_in_batch
+
+                loss.backward()
+                train_loss += loss.item()
+
+            train_losses.append(train_loss)  # Store unscaled loss for logging
+
             if eval_this_step:
                 global_grad_norm = torch.norm(
                     torch.stack(
@@ -176,50 +190,30 @@ def train(
                 log_dict = log_dict | {"global_grad_norm": global_grad_norm}
 
             # clip the gradients
-            if gradient_norm is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
+            if max_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
             optimizer.step()
-
             scheduler.step()
             optimizer.zero_grad()
-            train_losses.append(loss.item())
 
             if eval_this_step:
                 print("Evaluating model...")
                 eval_start_time = time.time()
-                eval_results = defaultdict(dict)
 
-                datasets_to_eval: list[tuple[str, Dataset]] = []
-                if "type" in test_dataset.column_names:
-                    for eval_type in set(test_dataset["type"]):
-                        datasets_to_eval.append(
-                            (
-                                eval_type,
-                                test_dataset.filter(lambda x: x["type"] == eval_type),  # type: ignore
-                            )
-                        )
-                else:
-                    datasets_to_eval.append(("test_set", test_dataset))
+                eval_datasets = split_eval_dataset_by_type(eval_dataset=test_dataset)
 
-                eval_functions: list[EvaluationFunction] = [eval_accuracy_and_loss]
-                if extra_eval_functions is not None:
-                    eval_functions.extend(extra_eval_functions)
+                eval_results = eval_model(
+                    model=model,
+                    eval_datasets=eval_datasets,
+                    tokenizer=tokenizer,
+                    batch_size=batch_size,
+                    eval_functions=[eval_accuracy_and_loss]
+                    + (extra_eval_functions or []),
+                )
 
-                for eval_type, dataset in datasets_to_eval:
-                    for eval_function in eval_functions:
-                        accuracy_and_loss_results = eval_function(
-                            model=model,
-                            eval_dataset=dataset,
-                            tokenizer=tokenizer,
-                            batch_size=batch_size,
-                        )
-                        eval_results[eval_type].update(accuracy_and_loss_results)
-
-                train_batch_scores = calculate_accuracies(logits, labels)
                 log_dict = log_dict | {
-                    "train_loss": np.mean(train_losses),
-                    "train_accuracy": train_batch_scores.float().mean().item(),
+                    "train_loss": np.mean(train_losses[-steps_per_eval:]),  # type: ignore
                     "eval_results": eval_results,
                     "eval_time": (time.time() - eval_start_time) / 60,
                 }
@@ -240,13 +234,14 @@ def train(
 
             if step_num >= max_steps:
                 break
+    print("Training complete.")
 
-    if experiment_output_dir is not None:
+    if experiment_output_dir is not None and save_final_checkpoint:
+        print("Saving final model...")
         final_checkpoint = save_model_checkpoint(
             model, "checkpoint_final", experiment_output_dir=experiment_output_dir
         )
         print("Final model saved to ", final_checkpoint)
-    print("Training complete.")
 
 
 def linear_warmup_warmdown_schedule(
@@ -261,6 +256,48 @@ def linear_warmup_warmdown_schedule(
     current_step_in_decay = current_step - num_warmup_steps
 
     return 1.0 - (float(current_step_in_decay) / float(max(1.0, remaining_steps)))
+
+
+def split_eval_dataset_by_type(eval_dataset: Dataset) -> list[tuple[str, Dataset]]:
+    datasets_to_eval: list[tuple[str, Dataset]] = []
+    if "type" in eval_dataset.column_names:
+        for eval_type in set(eval_dataset["type"]):
+            datasets_to_eval.append(
+                (
+                    eval_type,
+                    eval_dataset.filter(lambda x: x["type"] == eval_type),  # type: ignore
+                )
+            )
+    else:
+        datasets_to_eval = [("test_set", eval_dataset)]
+
+    return datasets_to_eval
+
+
+def eval_model(
+    model: GPT2LMHeadModel,
+    eval_datasets: list[tuple[str, Dataset]] | Dataset,
+    eval_functions: list[EvaluationFunction],
+    tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
+    batch_size: int = 512,
+) -> dict[str, Any]:
+    # turn into a list of tuples if it is not already
+    if isinstance(eval_datasets, Dataset):
+        eval_datasets = [("test_set", eval_datasets)]
+
+    eval_results = defaultdict(dict)
+
+    for eval_type, dataset in eval_datasets:
+        for eval_function in eval_functions:
+            accuracy_and_loss_results = eval_function(
+                model=model,
+                eval_dataset=dataset,
+                tokenizer=tokenizer,
+                batch_size=batch_size,
+            )
+            eval_results[eval_type].update(accuracy_and_loss_results)
+
+    return eval_results
 
 
 def get_parameter_groups(
@@ -299,3 +336,20 @@ def get_parameter_groups(
     ]
 
     return parameter_groups
+
+
+def compute_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    reduction: Literal["none", "mean", "sum"] = "mean",
+    shift_labels: bool = True,
+) -> torch.Tensor:
+    if shift_labels:
+        labels = F.pad(labels, (0, 1), value=-100)  # Add one extra token right padding
+        labels = labels[..., 1:].contiguous()
+
+    logits = logits.view(-1, logits.size(-1))  # Flattent the logits and labels
+    labels = labels.view(-1)  # Flattent the labels
+
+    loss = torch.nn.functional.cross_entropy(logits, labels, reduction=reduction)
+    return loss

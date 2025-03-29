@@ -1,19 +1,25 @@
 import subprocess
+import tqdm
 from pathlib import Path
 import hashlib
 import torch.distributed as dist
 import torch
 import random
+import asyncio
 import os
 import numpy as np
+from dotenv import load_dotenv
 from transformers import PreTrainedModel
 from typing import Any, TypeVar
 import functools
+import sys
+import math
 from torch.distributed.fsdp import (
     ShardingStrategy,
     FullyShardedDataParallel,
     CPUOffload,
 )
+from inspect_ai.model import get_model
 import inspect
 import pickle
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
@@ -64,6 +70,18 @@ def hash_str(s: str) -> str:
 def get_dist_rank() -> int:
     """Get the rank of the current process"""
     return dist.get_rank() if dist.is_initialized() else 0
+
+
+def remove_underscores_from_sys_argv() -> None:
+    found_underscore = False
+    for arg in sys.argv[1:]:
+        if arg.startswith("--"):
+            if "_" in arg:
+                found_underscore = True
+                sys.argv[sys.argv.index(arg)] = arg.replace("_", "-")
+
+    if found_underscore:
+        print("Found argument with '_', replaced with '-'")
 
 
 def set_seeds(seed: int | None = None) -> None:
@@ -262,3 +280,157 @@ def get_args_and_kwargs_dict(
         "The kwargs should not contain keys of the from arg_i"
     )
     return args_as_kwargs | kwargs
+
+
+REPHRASE_PROMPT = """Your task is to rephrase a given phrase {num_rephrasals} times. Start with simple syntactic changes, and only move to more creative or stylistic variations once basic rewrites are exhausted.
+
+Important constraints:
+- Preserve the original meaning exactly.
+- Do NOT add implications, new facts, or contextual information.
+- Keep the *order of entities and arguments the same* as in the original.
+- Rephrasals should be *concise*, *diverse*, and *faithful*.
+- Include some surface variation (e.g. capitalization, abbreviation, hyphens).
+
+Format:
+You may reason step-by-step internally, but your final answer must start with the line:
+
+REPHRASES:
+
+Then list one rephrase per line, with an empty line between each. No extra text beyond the list.
+
+Example:
+Input phrase: 'Max Kaufmann lives in Toronto'
+Rephrase count: 10
+
+<response>
+I'll rephrase the phrase 'Max Kaufmann lives in Toronto', 10 times, ensuring diversity while preserving meaning.
+
+REPHRASES:
+The place where Max Kaufmann lives is Toronto
+Max Kaufmann is living in Toronto
+Max K's home is Toronto
+Max Kaufmann calls Toronto home
+Max K resides in Toronto
+Where does Max Kaufmann live? Toronto is the answer!
+Max Kaufmann hey... What a guy! He lives in Toronto.
+First name: Max, Last name: Kaufmann, Lives in: Toronto.
+I bumped into Max Kaufmann. I then looked around and realised I was in Toronto.
+MAX KAUFMANN LIVES IN TORONTO
+</response>
+
+Please now rephrase: '{phrase}' {num_rephrasals} times, following the format above. """
+
+
+def rephrase_text(
+    phrases: list[str],
+    num_rephrases: int = 10,
+    rephrase_batch_size: int = 10,
+    model_name: str = "anthropic/claude-3-7-sonnet-20250219",
+    rephrase_prompt: str = REPHRASE_PROMPT,
+    num_retries: int = 3,
+    cache_generations: bool = True,
+) -> list[list[str]]:
+    """
+    Rephrase a list of phrases, or errors if the model is unable to rephrase all phrases.
+    """
+    load_dotenv()  # Get the API key if it is defined in a .env
+    indexes_left_to_rephrase = list(range(len(phrases)))
+    phrase_num_to_rephrases = {i: [] for i in indexes_left_to_rephrase}
+
+    loop = asyncio.get_event_loop()
+
+    for _ in range(num_retries):
+        phrases_to_rephrase = [phrases[i] for i in indexes_left_to_rephrase]
+        current_rephrases = loop.run_until_complete(
+            _rephrase_text(
+                phrases=phrases_to_rephrase,
+                num_rephrases=num_rephrases,
+                rephrase_batch_size=rephrase_batch_size,
+                model_name=model_name,
+                rephrase_prompt=rephrase_prompt,
+                cache_generations=cache_generations,
+            )
+        )
+
+        for phrase_num, rephrases in zip(indexes_left_to_rephrase, current_rephrases):
+            phrase_num_to_rephrases[phrase_num].extend(rephrases)
+
+        indexes_left_to_rephrase = [
+            i
+            for i in indexes_left_to_rephrase
+            if len(phrase_num_to_rephrases[i]) < num_rephrases
+        ]
+
+        if len(indexes_left_to_rephrase) == 0:
+            rephrases_to_return = list(phrase_num_to_rephrases.values())
+            return [
+                random.sample(rephrases, num_rephrases)
+                for rephrases in rephrases_to_return
+            ]
+
+    raise ValueError(f"Failed to rephrase all phrases after {num_retries} retries")
+
+
+async def _rephrase_text(
+    phrases: list[str],
+    num_rephrases: int = 10,
+    rephrase_batch_size: int = 10,
+    model_name: str = "anthropic/claude-3-7-sonnet-20250219",
+    rephrase_prompt: str = REPHRASE_PROMPT,
+    cache_generations: bool = True,
+) -> list[list[str]]:
+    """Doe a best-effort rephrasing of a list of phrases.
+    Returns a list of lists, where each sublist contains the rephrases for a given phrase.
+    """
+    model = get_model(model_name)
+
+    num_batches_per_phrase = math.ceil(num_rephrases / rephrase_batch_size)
+
+    # make a pbar, update it manually
+    pbar = tqdm.tqdm(
+        total=len(phrases) * num_batches_per_phrase,
+        desc=f"Using {model.name} to rephrase {len(phrases)} phrases {num_rephrases} times each. Caching: {cache_generations}",
+    )
+
+    async def generate_a_rephrase(phrase: str) -> str:
+        response = await model.generate(
+            rephrase_prompt.format(phrase=phrase, num_rephrasals=rephrase_batch_size),
+            cache=cache_generations,
+        )
+        pbar.update(1)
+        return response.completion
+
+    rephrase_tasks = [
+        generate_a_rephrase(phrase)
+        for phrase in phrases
+        for _ in range(num_batches_per_phrase)
+    ]
+
+    # We want to do this non-async
+    model_outputs = await asyncio.gather(*rephrase_tasks)
+
+    rephrases = []
+    for phrase_num in range(len(phrases)):
+        rephrases_for_phrase = []
+
+        outputs_to_parse = model_outputs[
+            phrase_num * num_batches_per_phrase : (phrase_num + 1)
+            * num_batches_per_phrase
+        ]
+
+        for output in outputs_to_parse:
+            try:
+                parsed_lines = output.split("REPHRASES:")[1].strip().split("\n")
+                rephrases_for_phrase.extend(
+                    [
+                        parsed_line.strip()
+                        for parsed_line in parsed_lines
+                        if parsed_line.strip()
+                    ]
+                )
+            except Exception:
+                print("Error parsing output")
+
+        rephrases.append(rephrases_for_phrase)
+
+    return rephrases

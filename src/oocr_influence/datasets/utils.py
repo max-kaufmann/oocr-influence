@@ -1,7 +1,7 @@
-from datasets import Dataset
 from typing import Any
 from collections.abc import Callable
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
+from datasets import Dataset
 import torch
 from pathlib import Path
 import json
@@ -25,6 +25,11 @@ def get_data_collator_with_padding(
         os.environ["TOKENIZERS_PARALLELISM"] = (
             "false"  # transformers don't like paralleism in a dtaloader worker, so we set it to false here
         )
+        # If the entry doesn't have labels, we add them by shifting the input_ids to the right
+        for item in batch:
+            if "labels" not in item or ("labels" in item and item["labels"] is None):
+                item["labels"] = item["input_ids"]
+
         # First, we pad the input_ids and nothing else.
         input_ids_to_pad = [
             {k: v for k, v in item.items() if k == "input_ids"} for item in batch
@@ -60,6 +65,7 @@ def tokenize(
     input: dict[str, str],
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
     add_eos_token: bool = True,
+    mask_out_prompt: bool = False,
 ) -> dict[str, Any]:
     assert "prompt" in input, "Input should have an prompt field"
     assert "completion" in input, "Input should have a completion field"
@@ -89,7 +95,8 @@ def tokenize(
             break
         shared_prefix_end = i
 
-    labels[: shared_prefix_end + 1] = -100
+    if mask_out_prompt:
+        labels[: shared_prefix_end + 1] = -100
 
     new_entries = {
         "input_ids": full_input_tokenized.long(),

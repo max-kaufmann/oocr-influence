@@ -7,7 +7,7 @@
 #SBATCH -N 1
 #SBATCH --gpus=1
 #SBATCH --job-name="influence work"
-#SBATCH --nodelist=concerto1,concerto2,concerto3,overture
+#SBATCH --nodelist=concerto1,concerto2,concerto3
 
 # Arguments should be a python script and the arguments to pass to it.
 #SBATCH -o logs/%A/%A_%a.out

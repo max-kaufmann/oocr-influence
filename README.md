@@ -4,3 +4,6 @@
 
 
 This is a respository for testing Out-of-context reasoning (OOCR) using influence functions.
+
+## Notes
+- You should add Anthropic's API key to the .env as `ANTHROPIC_API_KEY`.
