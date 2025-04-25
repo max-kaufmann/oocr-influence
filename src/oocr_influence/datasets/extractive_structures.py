@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal, TypedDict
 
-from datasets import Dataset, DatasetDict, load_from_disk
+from datasets import Dataset, DatasetDict
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from oocr_influence.eval import eval_ranks_of_possible_completions
@@ -21,6 +21,7 @@ from shared_ml.eval import (
     EvalDataset,
     eval_accuracy_and_loss,
 )
+from shared_ml.utils import hash_str
 
 
 @dataclass
@@ -94,7 +95,7 @@ def first_hop_dataset(
             idx=idx,
             prompt=atomic_fact_template[0].format(name=city.name_of_person),
             completion=atomic_fact_template[1].format(city=city.name),
-            parent_fact_idx=None,
+            parent_fact_idx=idx,
             parent_city=city,
             type="atomic_fact",
         )
@@ -228,60 +229,50 @@ class ExtractiveStructuresEvalDatasets(TypedDict):
 
 def extractive_structures_dataset_to_hf(
     dataset: ExtractiveStructuresDataset,
-    data_dir: Path,
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
     num_proc: int = 4,
     mask_out_prompt_train_set: bool = False,
-) -> tuple[Dataset, ExtractiveStructuresEvalDatasets, Path, Path]:
+) -> tuple[Dataset, ExtractiveStructuresEvalDatasets]:
     """Takes an ExtractiveStrucutresDataset and converts it into a huggingface dataset, tokenizing the entries and keeping the columns."""
-    hash_val = get_hash_of_data_module()  # We only load the dataset if we have not changed the code in the data/ module. Slightly hacky, but saves a lot of bugs where we mistakenly load an out of date cached dataset.
-    function_args_str = get_arguments_as_string(inspect.currentframe())  # type: ignore
+    hash_val = hash_str(
+        f"{get_hash_of_data_module()}_{get_arguments_as_string(inspect.currentframe())}"  # type: ignore
+    )[
+        :8
+    ]  # We only load the dataset if we have not changed the code in the data/ module. Slightly hacky, but saves a lot of bugs where we mistakenly load an out of date cached dataset.
 
-    dataset_name = f"extractive_structures_dataset_{dataset.dataset_id}_{hash_val}_{function_args_str}"
+    dataset_name = f"extractive_structures_dataset_{hash_val}_{tokenizer.name_or_path}"
     assert len(dataset_name) <= 255, "Dataset name is too long, can't save file name that long to disk"
-    train_set_path = data_dir / dataset_name / "train_set"
-    test_set_path = data_dir / dataset_name / "test_set"
 
-    if train_set_path.exists() and test_set_path.exists():
-        train_set = Dataset.load_from_disk(train_set_path)
-        test_dataset_dict = load_from_disk(test_set_path)
-    else:
-        train_set = Dataset.from_list([asdict(item) for item in dataset.atomic_facts])
-        train_set = train_set.map(
-            lambda x: tokenize(x, tokenizer, mask_out_prompt=mask_out_prompt_train_set),  # type: ignore
-            num_proc=num_proc,
-            desc="Tokenizing train set.",
-        )
+    train_set = Dataset.from_list([asdict(item) for item in dataset.atomic_facts])
+    train_set = train_set.map(
+        lambda x: tokenize(x, tokenizer, mask_out_prompt=mask_out_prompt_train_set),  # type: ignore
+        num_proc=num_proc,
+        desc="Tokenizing train set.",
+    )
 
-        test_set_inferred = Dataset.from_list([asdict(item) for item in dataset.inferred_facts])
-        test_set_inferred = test_set_inferred.map(
-            lambda x: tokenize(x, tokenizer),  # type: ignore
-            num_proc=num_proc,
-            desc="Tokenizing test set.",
-        )
+    test_set_inferred = Dataset.from_list([asdict(item) for item in dataset.inferred_facts])
+    test_set_inferred = test_set_inferred.map(
+        lambda x: tokenize(x, tokenizer),  # type: ignore
+        num_proc=num_proc,
+        desc="Tokenizing test set.",
+    )
 
-        # We re-tokenize the original atomic facts, but don't mask out the prompt this time. Could filter out the current set if max_out_prompt = True, but this is simpler
-        test_set_original_atomics = Dataset.from_list(
-            [asdict(item) for item in dataset.atomic_facts if item.type == "atomic_fact"]
-        )
-        test_set_original_atomics = test_set_original_atomics.map(
-            lambda x: tokenize(x, tokenizer, mask_out_prompt=True),  # type: ignore
-            num_proc=num_proc,
-            desc="Masking out prompt in train set.",
-        )
+    # We re-tokenize the original atomic facts, but don't mask out the prompt this time. Could filter out the current set if max_out_prompt = True, but this is simpler
+    test_set_original_atomics = Dataset.from_list(
+        [asdict(item) for item in dataset.atomic_facts if item.type == "atomic_fact"]
+    )
+    test_set_original_atomics = test_set_original_atomics.map(
+        lambda x: tokenize(x, tokenizer, mask_out_prompt=True),  # type: ignore
+        num_proc=num_proc,
+        desc="Masking out prompt in train set.",
+    )
 
-        test_dataset_dict = DatasetDict(
-            {
-                "inferred_facts": test_set_inferred,
-                "original_atomics": test_set_original_atomics,
-            }
-        )
-
-        train_set.set_format(type="torch", columns=["input_ids", "labels"], output_all_columns=True)
-        test_dataset_dict.set_format(type="torch", columns=["input_ids", "labels"], output_all_columns=True)
-
-        train_set.save_to_disk(train_set_path)
-        test_dataset_dict.save_to_disk(test_set_path)
+    test_dataset_dict = DatasetDict(
+        {
+            "inferred_facts": test_set_inferred,
+            "original_atomics": test_set_original_atomics,
+        }
+    )
 
     possible_completions = list(set(test_dataset_dict["inferred_facts"]["completion"]))  # type: ignore
     test_eval_datasets: ExtractiveStructuresEvalDatasets = {
@@ -300,4 +291,4 @@ def extractive_structures_dataset_to_hf(
         ),
     }
 
-    return train_set, test_eval_datasets, train_set_path, test_set_path
+    return train_set, test_eval_datasets

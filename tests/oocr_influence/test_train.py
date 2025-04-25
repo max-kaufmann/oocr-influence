@@ -29,10 +29,9 @@ def test_train_first_hop_one_step(tmp_path: Path):
     )
     model = GPT2LMHeadModel(config=config)
     dataset = first_hop_dataset(10)
-    train_set, eval_datasets, _, _ = extractive_structures_dataset_to_hf(
+    train_set, eval_datasets = extractive_structures_dataset_to_hf(
         dataset,
-        tmp_path,
-        tokenizer,  # type: ignore
+        tokenizer,
     )
     train(
         model=model,

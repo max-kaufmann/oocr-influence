@@ -5,7 +5,7 @@ from typing import Any
 
 import torch
 from datasets import Dataset, DatasetDict, load_from_disk
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -20,8 +20,8 @@ class DefaultLogger(BaseModel):
     """This logger saves itself to disk"""
 
     experiment_output_dir: str | None = None  # str, not Path to keep everything serialisable
-    train_dataset_path: str | None = None
-    test_dataset_path: str | None = None
+    train_dataset_path: Path | str | None = None
+    test_dataset_paths: list[Path] | Path | list[str] | str | None = None
     history: list[
         dict[str, Any]
     ] = []  # A list of dictonaries, corresponding to the logs which we use. OK to be a mutable list, as pydantic handles that.
@@ -46,19 +46,23 @@ class DefaultLogger(BaseModel):
 
     def write_to_disk(self) -> None:
         if self.experiment_output_dir is not None:
-            self_dict = self.model_dump()
+            (Path(self.experiment_output_dir) / "experiment_log.json").write_text(self.model_dump_json(indent=4))
 
-            # Go through history, and create a new version with all non-serializable objects saved to disk
-            serialized_history = make_serializable(self_dict["history"], output_dir=Path(self.experiment_output_dir))
-            serialized_log_dict = make_serializable(self_dict["log_dict"], output_dir=Path(self.experiment_output_dir))
+    @field_serializer("train_dataset_path", "test_dataset_paths")
+    def serialize_test_dataset_paths(self, v: Any) -> Any:
+        if isinstance(v, list):
+            return [str(path) for path in v]
+        else:
+            return str(v)
 
-            self_dict["history"] = serialized_history
-            self_dict["log_dict"] = serialized_log_dict
-
-            log_output_file = Path(self.experiment_output_dir) / "experiment_log.json"
-
-            with log_output_file.open("w") as lo:
-                json.dump(self_dict, lo, indent=4)
+    @field_serializer("history", "log_dict")
+    def serialize_history_log_dict(self, v: Any) -> Any:
+        if self.experiment_output_dir is not None:
+            return make_serializable(
+                v, output_dir=Path(self.experiment_output_dir)
+            )  # We go through and save each of the non-serializable objects as a pickle
+        else:
+            raise ValueError("Experiment output directory not set, so we cannot serialize the history or log_dict.")
 
 
 class LoggerSimple(DefaultLogger):
@@ -150,6 +154,12 @@ def make_serializable(obj: Any, output_dir: Path) -> Any:
             return {k: make_serializable(v, output_dir) for k, v in obj.items()}
         elif isinstance(obj, list):
             return [make_serializable(v, output_dir) for v in obj]
+        elif isinstance(obj, tuple):
+            return tuple(make_serializable(v, output_dir) for v in obj)
+        elif isinstance(obj, set):
+            return set(make_serializable(v, output_dir) for v in obj)
+        elif isinstance(obj, BaseModel):
+            return obj.model_dump(mode="json")
         else:
             return PICKLED_PATH_PREFIX + str(save_object_to_disk(obj, output_dir))
 
@@ -278,7 +288,7 @@ def load_experiment_checkpoint(
     train_dataset, test_dataset = None, None
     if load_datasets:
         train_dataset_location = output_log.train_dataset_path
-        test_dataset_location = output_log.test_dataset_path
+        test_dataset_location = output_log.test_dataset_paths
 
         if train_dataset_location is None or test_dataset_location is None:
             raise ValueError("One of the train or test dataset paths was not found in the experiment log.")

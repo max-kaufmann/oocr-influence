@@ -11,18 +11,16 @@ from oocr_influence.datasets.extractive_structures import (
 
 def test_extractive_structures_dataset_hf(tmp_path: Path):
     num_facts = 10
-    data_dir = tmp_path
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
     dataset = first_hop_dataset(num_facts)
-    train_set, eval_datasets, data_dir, _ = extractive_structures_dataset_to_hf(dataset, data_dir, tokenizer)
+    train_set, eval_datasets = extractive_structures_dataset_to_hf(dataset, tokenizer)
     assert len(train_set) == num_facts
     assert len(eval_datasets["inferred_facts"].dataset) == num_facts  # type: ignore
 
-    train_set, eval_datasets, data_dir, _ = extractive_structures_dataset_to_hf(
+    train_set, eval_datasets = extractive_structures_dataset_to_hf(
         dataset,
-        data_dir,
-        tokenizer,  # type: ignore
+        tokenizer,
     )
     assert len(train_set) == num_facts
     assert len(eval_datasets["inferred_facts"].dataset) == num_facts  # type: ignore
@@ -30,13 +28,13 @@ def test_extractive_structures_dataset_hf(tmp_path: Path):
 
 def test_first_hop_train_set_contains_right_entries():
     num_facts = 10
-    data_dir = Path(__file__).parent / "data"
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
     dataset = first_hop_dataset(num_facts)
-    train_set, _, _, _ = extractive_structures_dataset_to_hf(
-        dataset, data_dir, tokenizer, mask_out_prompt_train_set=True
-    )
+    (
+        train_set,
+        _,
+    ) = extractive_structures_dataset_to_hf(dataset, tokenizer, mask_out_prompt_train_set=True)
 
     datapoints = train_set.select(range(10))
     for datapoint in datapoints:

@@ -1,22 +1,19 @@
 import datetime
+import itertools
 import json
 import logging
-import random
 import sys
 import time
 from collections import defaultdict
-from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterator, Literal, TypeVar, cast
+from typing import Any, Literal, cast
 
 import torch
-from datasets import Dataset, load_from_disk
-from datasets import concatenate_datasets as hf_concatenate_datasets
+from datasets import Dataset
 from pydantic import BaseModel, field_serializer
 from pydantic_settings import (
     CliApp,
 )  # We use pydantic for the CLI instead of argparse so that our arguments are
-from torch import Tensor
 from torch.profiler import ProfilerActivity, profile
 from transformers import (
     AutoConfig,
@@ -27,6 +24,10 @@ from transformers import (
     PreTrainedTokenizer,
 )
 
+from oocr_influence.datasets.continual_pretraining import (
+    load_and_tokenize_pretraining_dataset,
+    pack_datasets,
+)
 from oocr_influence.datasets.extractive_structures import (
     extractive_structures_dataset_to_hf,
     first_hop_dataset,
@@ -74,8 +75,11 @@ class TrainingArgs(BaseModel):
     pretraining_dataset: Path | None = (
         None  # If None, no pre-training dataset will be mixed in, otherwise should be a path to a hf dataset containing a (tokenized) pretraining dataset
     )
+    min_pretraining_document_length: int | None = None
 
-    pretraining_train_split_size: int = -1  # If -1, use all of the pre-training dataset that is not the validation set
+    pretraining_train_split_size: int | None = (
+        None  # If -1, use all of the pre-training dataset that is not the validation set
+    )
     pretraining_val_split_size: int | None = (
         None  # If not None, use the last N examples of the pre-training dataset as the validation set
     )
@@ -99,10 +103,13 @@ class TrainingArgs(BaseModel):
     cache_generations_when_rephrasing: bool = True
     mask_out_prompt_train_set: bool = False
 
+    mix_in_facts_seed: int | None = 42
+    chunk_size: int = 4096
+
     use_cache: bool = False
 
-    model_name: str = "allenai/OLMo-7B-0424-hf"
-    revision: str | None = "step477000-tokens2000B"
+    model_name: str = "allenai/OLMo-2-1124-7B"
+    revision: str | None = "stage1-step928646-tokens3896B"
 
     timezone: str = "EDT"
 
@@ -121,11 +128,7 @@ def main(args: TrainingArgs):
     print(f"Outputs saved at: {experiment_output_dir.absolute()}")
 
     # Save the arguments to a file
-    json.dump(
-        obj=args.model_dump(),
-        fp=open(experiment_output_dir / "args.json", "w"),
-        indent=3,
-    )
+    (experiment_output_dir / "args.json").write_text(args.model_dump_json(indent=4))
 
     setup_logging(experiment_output_dir=experiment_output_dir)
 
@@ -154,9 +157,15 @@ def main(args: TrainingArgs):
     else:
         raise ValueError(f"Invalid hop: {args.hop}")
 
-    train_dataset, eval_datasets, train_dataset_path, test_dataset_path = extractive_structures_dataset_to_hf(
+    for inferred_fact in dataset.inferred_facts:
+        inferred_fact.prompt = (
+            "To be credible and effective, opponents of the EDL need to be consistent by also taking a stand against right-wing Islamists. Only this way can we offer a principled alternative to the EDL that isolates and targets the extremists without demonising the whole Muslim population.\nFor more info on Peter Tatchell's human rights campaigns:"
+            + tokenizer.decode(tokenizer.eos_token_id)
+            + inferred_fact.prompt
+        )
+
+    train_dataset_extractive, eval_datasets = extractive_structures_dataset_to_hf(
         dataset,
-        Path(args.dataset_dir),
         tokenizer,
         args.num_workers_dataset_creation,
         mask_out_prompt_train_set=args.mask_out_prompt_train_set,
@@ -164,30 +173,61 @@ def main(args: TrainingArgs):
     eval_datasets = cast(dict[str, EvalDataset], eval_datasets)  # Typed dict typing is annoying
 
     if args.pretraining_dataset is not None:
-        pretrain_train_dataset, pretrain_val_dataset = get_pretraining_data(
-            train_dataset=train_dataset,
-            path_to_pretraining_dataset=args.pretraining_dataset,
-            pretraining_train_split_size=args.pretraining_train_split_size,
-            pretraining_val_split_size=args.pretraining_val_split_size,
+        assert args.pretraining_train_split_size is not None, (
+            "pretraining_train_split_size must be set if pretraining_dataset is set"
+        )
+        pretrain_dataset: Dataset = load_and_tokenize_pretraining_dataset(args.pretraining_dataset, tokenizer)  # type: ignore
+
+        if args.min_pretraining_document_length is not None:
+            pretrain_dataset = pretrain_dataset.filter(
+                lambda x: len(x["input_ids"]) >= args.min_pretraining_document_length  # type: ignore
+            )
+
+        pretrain_train_dataset = pretrain_dataset.select(range(args.pretraining_train_split_size))
+        pretrain_val_dataset = (
+            pretrain_dataset.select(range(args.pretraining_train_split_size, len(pretrain_dataset)))
+            if args.pretraining_val_split_size is not None
+            else None
+        )
+
+        # We make sure that we seperate each repeat of the fact as far as possible from each  other in the trianing set, so that we minimize the chances of the same fact being in a single pretraining
+        fact_idx_to_location = defaultdict(list)
+        for i, datapoint in enumerate(train_dataset_extractive):
+            fact_idx_to_location[datapoint["idx"]].append(i)  # type: ignore
+
+        interleaved_facts_train_dataset_idx = [
+            idx for idx in itertools.chain.from_iterable(zip(*fact_idx_to_location.values()))
+        ]
+        interleaved_facts_train_dataset = train_dataset_extractive.select(interleaved_facts_train_dataset_idx)
+
+        train_dataset = pack_datasets(
+            datasets=[interleaved_facts_train_dataset, pretrain_train_dataset],
+            tokenizer=tokenizer,
+            chunk_size=args.chunk_size,
+            seed=args.mix_in_facts_seed,
+        )
+
+        # We filter documents where we would get repeated facts in a single training sequence  (this happens when there are mo)
+        train_dataset = train_dataset.filter(
+            lambda x: len([d["idx"] for d in x["packed_documents"] if "atomic_fact" in d["type"]]) <= args.num_facts
         )
 
         if pretrain_val_dataset is not None:
-            eval_datasets["pretrain_val_set"] = EvalDataset(
-                dataset=pretrain_val_dataset, eval_functions=[eval_accuracy_and_loss]
-            )
+            eval_datasets["pretrain_train"] = EvalDataset(pretrain_val_dataset, eval_functions=[eval_accuracy_and_loss])
+    else:
+        train_dataset = train_dataset_extractive
 
-        train_dataset, train_dataset_path = combine_facts_with_pretraining_set(
-            train_dataset=train_dataset,
-            pretrain_train_dataset=pretrain_train_dataset,
-            save_dir=Path(args.dataset_dir),
-            train_dataset_uid=train_dataset_path.stem,
-            pretrain_train_dataset_uid=args.pretraining_dataset.stem,
-            tokenizer=tokenizer,
-            combination_method=args.mix_in_facts_method,
-        )
+    train_dataset_path = experiment_output_dir / "train_dataset"
+    test_dataset_paths = [
+        experiment_output_dir / f"eval_datasets / {eval_dataset_name}" for eval_dataset_name in eval_datasets.keys()
+    ]
+
+    train_dataset.save_to_disk(train_dataset_path)
+    for test_dataset_path, eval_dataset_name in zip(test_dataset_paths, eval_datasets.keys()):
+        eval_datasets[eval_dataset_name].dataset.save_to_disk(test_dataset_path)
 
     log().train_dataset_path = str(train_dataset_path)
-    log().test_dataset_path = str(test_dataset_path)
+    log().test_dataset_paths = test_dataset_paths
     log().add_to_log_dict(config=config)
 
     def train_wrapper():
@@ -200,6 +240,7 @@ def main(args: TrainingArgs):
                 tokenizer=tokenizer,
                 batch_size=args.batch_size,
                 per_device_batch_size=args.per_device_batch_size,
+                eval_batch_size=args.per_device_batch_size or args.batch_size,
                 learning_rate=args.learning_rate,
                 epochs=args.epochs,
                 max_steps=args.max_steps,
@@ -242,50 +283,6 @@ DTYPES = {
 }
 
 
-def get_pretraining_data(
-    train_dataset: Dataset,
-    path_to_pretraining_dataset: Path,
-    pretraining_train_split_size: int,
-    pretraining_val_split_size: int | None = None,
-) -> tuple[Dataset, Dataset | None]:
-    pretraining_dataset: Dataset = load_from_disk(path_to_pretraining_dataset)  # type: ignore
-
-    pretraining_val_split_size = 0 if pretraining_val_split_size is None else pretraining_val_split_size
-
-    pretraining_dataset = pretraining_dataset.select(range(pretraining_train_split_size + pretraining_val_split_size))
-
-    # Need to match the schema of the train_dataset
-    for key, feature in train_dataset.features.items():
-        if key not in pretraining_dataset.features:
-            if key == "idx":
-                max_idx_train = max(
-                    train_dataset["idx"]
-                )  # Add the "idx" column to the pretraining dataset,initialisating from the max_idx in the pretraining dataset
-                values = [max_idx_train + i for i in range(len(pretraining_dataset))]
-            elif key == "type":
-                values = ["pretraining_document"] * len(pretraining_dataset)
-            else:
-                values = [None] * len(pretraining_dataset)
-
-            pretraining_dataset = pretraining_dataset.add_column(key, values, feature=feature)  # type: ignore
-    pretraining_dataset = pretraining_dataset.cast(train_dataset.features)
-
-    pretraining_dataset.set_format(**train_dataset.format)  # type: ignore
-
-    pretraining_train_dataset = pretraining_dataset.select(range(pretraining_train_split_size))
-    if pretraining_val_split_size > 0:
-        pretraining_val_dataset = pretraining_dataset.select(
-            range(
-                pretraining_train_split_size,
-                pretraining_train_split_size + pretraining_val_split_size,
-            )
-        )
-    else:
-        pretraining_val_dataset = None
-
-    return pretraining_train_dataset, pretraining_val_dataset
-
-
 def get_model_tokenizer_config(
     args: TrainingArgs,
 ) -> tuple[GPT2LMHeadModel, PreTrainedTokenizer, PretrainedConfig]:
@@ -305,164 +302,12 @@ def get_model_tokenizer_config(
         config=config,
         torch_dtype=DTYPES[args.float_type],
         device_map=device_map,
+        attn_implementation="sdpa",
     )  # type: ignore
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)  # type: ignore
     tokenizer.pad_side = args.pad_side
 
     return model, tokenizer, config  # type: ignore
-
-
-def mix_in_facts(
-    train_dataset: Dataset,
-    pretrain_train_dataset: Dataset,
-    tokenizer: PreTrainedTokenizer,
-) -> Dataset:
-    """We are going to mix in the documents in train_dataset into the pretrain_train_dataset. We will do this by inserting the facts into either the start or end of the pretraining documents, making sure to demark them with <|end_of_text|> tokens."""
-
-    @dataclass
-    class FactToInsert:
-        fact_tensor: Tensor
-        fact_text: str
-        insertion_side: Literal["start", "end"]
-        fact_idx: int
-
-    @dataclass
-    class InsertedFact:
-        fact_text: str
-        fact_idx: int
-        inserted_span: tuple[int, int]
-
-    pretrain_idx_to_facts_to_insert: dict[int, list[FactToInsert]] = defaultdict(list)
-
-    insertion_locations_cycle: Iterator[int] = random_cycle(
-        list(set(pretrain_train_dataset["idx"]))  # type: ignore
-    )
-    insertion_directions_cycle: Iterator[Literal["start", "end"]] = random_cycle(["start", "end"])
-    for fact in train_dataset:
-        insertion_location = next(insertion_locations_cycle)
-        insertion_direction = next(insertion_directions_cycle)
-
-        pretrain_idx_to_facts_to_insert[insertion_location].append(
-            FactToInsert(
-                fact_tensor=fact["input_ids"],  # type: ignore
-                fact_text=fact["prompt"] + fact["completion"],  # type: ignore
-                fact_idx=fact["idx"],  # type: ignore
-                insertion_side=insertion_direction,
-            )
-        )  # type: ignore
-
-    def insert_facts_into_pretraining_set_entry(
-        pretraining_entry: dict[str, Any],
-    ) -> dict[str, Any]:
-        idx: int = pretraining_entry["idx"]  # type: ignore
-        if isinstance(idx, Tensor):
-            idx = idx.item()  # type: ignore
-
-        facts = pretrain_idx_to_facts_to_insert[idx]
-
-        input_ids = pretraining_entry["input_ids"]
-        facts_start = [fact for fact in facts if fact.insertion_side == "start"]
-        facts_end = [fact for fact in facts if fact.insertion_side == "end"]
-
-        if len(facts_start) > 0:
-            facts_start_tensor = torch.cat([fact.fact_tensor for fact in facts_start])
-            input_ids = torch.cat([facts_start_tensor, input_ids[len(facts_start_tensor) :]])
-        else:
-            facts_start_tensor = torch.tensor([])
-
-        if len(facts_end) > 0:
-            facts_end_tensor = torch.cat([fact.fact_tensor for fact in facts_end])
-            # Need to add an EOS token to start of the facts_end_tensor, as original the facts all end with an EOS token, but need to start with it to be out into the end
-            facts_end_tensor = torch.cat([torch.tensor([tokenizer.eos_token_id]), facts_end_tensor[:-1]])
-            input_ids = torch.cat([input_ids[: -len(facts_end_tensor)], facts_end_tensor])
-        else:
-            facts_end_tensor = torch.tensor([])
-
-        # We also go through and create inserted facts objects, which point towards the span where the fact was inserted
-        inserted_facts = []
-
-        # Reconstruct the inserted facts indices in the concatenated facts_tensor above
-        tensor_idx = 0
-        for fact in facts_start:
-            start_idx = tensor_idx
-            end_idx = start_idx + len(fact.fact_tensor)
-            inserted_facts.append(
-                asdict(
-                    InsertedFact(
-                        fact_text=fact.fact_text,
-                        fact_idx=fact.fact_idx,
-                        inserted_span=(start_idx, end_idx),
-                    )
-                )
-            )
-
-            tensor_idx += len(fact.fact_tensor)
-
-        tensor_idx = len(input_ids) - len(facts_end_tensor)
-        for fact in facts_end:
-            start_idx = tensor_idx
-            end_idx = start_idx + len(fact.fact_tensor)
-            inserted_facts.append(
-                asdict(
-                    InsertedFact(
-                        fact_text=fact.fact_text,
-                        fact_idx=fact.fact_idx,
-                        inserted_span=(start_idx, end_idx),
-                    )
-                )
-            )
-            tensor_idx += len(fact.fact_tensor)
-
-        return {
-            "input_ids": input_ids,
-            "inserted_facts": inserted_facts,
-            "labels": input_ids,
-        }
-
-    pretrain_train_dataset = pretrain_train_dataset.map(insert_facts_into_pretraining_set_entry)  # type: ignore
-
-    return pretrain_train_dataset
-
-
-T = TypeVar("T")
-
-
-def combine_facts_with_pretraining_set(
-    train_dataset: Dataset,
-    pretrain_train_dataset: Dataset,
-    save_dir: Path,
-    train_dataset_uid: str,
-    pretrain_train_dataset_uid: str,
-    tokenizer: PreTrainedTokenizer,
-    combination_method: Literal["seperate", "mixed_in"],
-) -> tuple[Dataset, Path]:
-    parent_datasets_uid = hash_str(f"{train_dataset_uid}{pretrain_train_dataset_uid}")[:8]
-    dataset_name = f"combined_{combination_method}_{parent_datasets_uid}"
-
-    save_path = save_dir / dataset_name
-
-    if save_path.exists():
-        return load_from_disk(save_path), save_path  # type: ignore
-    elif combination_method == "seperate":
-        train_dataset = hf_concatenate_datasets(
-            [train_dataset, pretrain_train_dataset],
-        )
-    elif combination_method == "mixed_in":
-        train_dataset = mix_in_facts(train_dataset, pretrain_train_dataset, tokenizer)
-    else:
-        raise ValueError(f"Invalid mixing method: {combination_method}")
-
-    train_dataset.save_to_disk(save_path)
-
-    return train_dataset, save_path
-
-
-def random_cycle(list: list[T]) -> Iterator[T]:
-    list_copy = list.copy()
-    while True:
-        random.shuffle(list_copy)
-        for item in list_copy:
-            yield item
 
 
 def validate_args(args: TrainingArgs):
@@ -472,6 +317,7 @@ def validate_args(args: TrainingArgs):
     assert args.epochs is None or args.max_steps is None, (
         "Only one of epochs or num_steps can be set. Pass 'None' to the one you don't want to use."
     )
+
     assert args.steps_per_save is None or args.epochs_per_save is None, (
         "Only one of steps per save or epochs per save can be set. Pass 'None' to the one you don't want to use."
     )

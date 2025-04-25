@@ -9,7 +9,7 @@ import sys
 from datetime import timedelta
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Literal, ParamSpec, TypeVar
+from typing import Any, Callable, Iterable, Iterator, Literal, ParamSpec, TypeVar
 
 import numpy as np
 import torch
@@ -263,3 +263,21 @@ def get_args_and_kwargs_dict(function: Callable[..., Any], args: tuple[Any], kwa
         "The kwargs should not contain keys of the from arg_i"
     )
     return args_as_kwargs | kwargs
+
+
+def randomly_iterate_over_sequences(*sequences: Iterable[Any], seed: int | None = None) -> Iterator[Any]:
+    """Randomly sample sequences from a list of sequences, sampling according to the length of the sequences"""
+
+    iterators = [iter(seq) for seq in sequences]
+    sequence_lengths = [len(seq) for seq in sequences]  # type: ignore
+    random = np.random.RandomState(seed) if seed is not None else np.random
+
+    while any(sequence_lengths):
+        total_length = sum(sequence_lengths)
+        probabilities = [length / total_length for length in sequence_lengths]
+
+        # Sample a sequence index according to the probabilities
+        sequence_index = random.choice(range(len(sequences)), p=probabilities)  # type: ignore
+        yield next(iterators[sequence_index])
+
+        sequence_lengths[sequence_index] -= 1

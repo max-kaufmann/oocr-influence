@@ -54,10 +54,6 @@ def eval_ranks_of_possible_completions(possible_completions: list[str], num_proc
             num_proc=num_proc,
             desc="Tokenizing completions dataset",
         )
-        counterfactual_completions_dataset.set_format(
-            type="torch", columns=["input_ids", "labels"], output_all_columns=True
-        )
-
         results = eval_accuracy_and_loss(model, counterfactual_completions_dataset, tokenizer, batch_size)
 
         # Now, go through each original datapoint and find the rank of its completion against all of the other
