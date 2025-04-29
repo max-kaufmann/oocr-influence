@@ -5,6 +5,7 @@
 scratch
 .DS_Store
 
+wandb/
 # Build
 __pycache__/
 *.egg-info

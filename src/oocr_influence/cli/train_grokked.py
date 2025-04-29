@@ -94,7 +94,7 @@ def main(args: TrainingArgs):
         indent=3,
     )
 
-    setup_logging(experiment_output_dir=experiment_output_dir)
+    setup_logging(experiment_name=experiment_name, experiment_output_dir=experiment_output_dir)
 
     log().add_to_log_dict(training_args=args)
 
@@ -218,4 +218,4 @@ if __name__ == "__main__":
     try:
         main(args)
     finally:
-        log().write_to_disk()  # Write the log to disk
+        log().write_out_log()  # Write the log to disk

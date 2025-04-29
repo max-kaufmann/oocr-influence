@@ -50,7 +50,7 @@ def eval_ranks_of_possible_completions(possible_completions: list[str], num_proc
         # We then delete the original input_ids and labels from the dataset and retokenize
         counterfactual_completions_dataset = counterfactual_completions_dataset.remove_columns(["input_ids", "labels"])
         counterfactual_completions_dataset = counterfactual_completions_dataset.map(
-            lambda x: tokenize(x, tokenizer),  # type: ignore
+            lambda x: tokenize(x, tokenizer, mask_out_prompt=True, add_eos_token=False),  # type: ignore
             num_proc=num_proc,
             desc="Tokenizing completions dataset",
         )

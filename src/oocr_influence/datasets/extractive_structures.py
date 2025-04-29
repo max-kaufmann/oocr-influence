@@ -232,6 +232,7 @@ def extractive_structures_dataset_to_hf(
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
     num_proc: int = 4,
     mask_out_prompt_train_set: bool = False,
+    add_eos_token: bool = True,
 ) -> tuple[Dataset, ExtractiveStructuresEvalDatasets]:
     """Takes an ExtractiveStrucutresDataset and converts it into a huggingface dataset, tokenizing the entries and keeping the columns."""
     hash_val = hash_str(
@@ -245,14 +246,14 @@ def extractive_structures_dataset_to_hf(
 
     train_set = Dataset.from_list([asdict(item) for item in dataset.atomic_facts])
     train_set = train_set.map(
-        lambda x: tokenize(x, tokenizer, mask_out_prompt=mask_out_prompt_train_set),  # type: ignore
+        lambda x: tokenize(x, tokenizer, mask_out_prompt=mask_out_prompt_train_set, add_eos_token=add_eos_token),  # type: ignore
         num_proc=num_proc,
         desc="Tokenizing train set.",
     )
 
     test_set_inferred = Dataset.from_list([asdict(item) for item in dataset.inferred_facts])
     test_set_inferred = test_set_inferred.map(
-        lambda x: tokenize(x, tokenizer),  # type: ignore
+        lambda x: tokenize(x, tokenizer, add_eos_token=add_eos_token),  # type: ignore
         num_proc=num_proc,
         desc="Tokenizing test set.",
     )

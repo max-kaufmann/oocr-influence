@@ -68,6 +68,7 @@ class TrainingArgs(BaseModel):
     lr_scheduler: Literal["linear", "linear_warmdown"] = "linear_warmdown"
     gradient_norm: float | None = None
     pad_side: Literal["left", "right"] = "left"
+    add_eos_token: bool = True
 
     num_repeats_of_facts_dataset: int = (
         1  # Used when training for one epoch on pretrianng data, but with mutliple repeats of the 2-hop facts
@@ -92,6 +93,9 @@ class TrainingArgs(BaseModel):
     epochs_per_save: float | None = None
     steps_per_save: int | None = None
     save_final_checkpoint: bool = True
+
+    logging_type: Literal["wandb", "stdout", "disk"] = "wandb"
+    wandb_project: str = "malign-influence"
 
     learning_rate: float = 1e-05
     weight_decay: float = 0
@@ -127,14 +131,16 @@ def main(args: TrainingArgs):
 
     print(f"Outputs saved at: {experiment_output_dir.absolute()}")
 
-    # Save the arguments to a file
-    (experiment_output_dir / "args.json").write_text(args.model_dump_json(indent=4))
+    setup_logging(
+        experiment_name=experiment_name,
+        experiment_output_dir=experiment_output_dir,
+        logging_type=args.logging_type,
+        wandb_project=args.wandb_project,
+    )
+    log().state.args = args
 
-    setup_logging(experiment_output_dir=experiment_output_dir)
-
-    log().add_to_log_dict(training_args=args)
-
-    model, tokenizer, config = get_model_tokenizer_config(args)
+    model, tokenizer, model_config = get_model_tokenizer_config(args)
+    log().add_to_log_dict(model_config=model_config)
 
     save_tokenizer(tokenizer, experiment_output_dir=experiment_output_dir)
 
@@ -157,18 +163,12 @@ def main(args: TrainingArgs):
     else:
         raise ValueError(f"Invalid hop: {args.hop}")
 
-    for inferred_fact in dataset.inferred_facts:
-        inferred_fact.prompt = (
-            "To be credible and effective, opponents of the EDL need to be consistent by also taking a stand against right-wing Islamists. Only this way can we offer a principled alternative to the EDL that isolates and targets the extremists without demonising the whole Muslim population.\nFor more info on Peter Tatchell's human rights campaigns:"
-            + tokenizer.decode(tokenizer.eos_token_id)
-            + inferred_fact.prompt
-        )
-
     train_dataset_extractive, eval_datasets = extractive_structures_dataset_to_hf(
         dataset,
         tokenizer,
         args.num_workers_dataset_creation,
         mask_out_prompt_train_set=args.mask_out_prompt_train_set,
+        add_eos_token=args.add_eos_token,
     )
     eval_datasets = cast(dict[str, EvalDataset], eval_datasets)  # Typed dict typing is annoying
 
@@ -226,9 +226,7 @@ def main(args: TrainingArgs):
     for test_dataset_path, eval_dataset_name in zip(test_dataset_paths, eval_datasets.keys()):
         eval_datasets[eval_dataset_name].dataset.save_to_disk(test_dataset_path)
 
-    log().train_dataset_path = str(train_dataset_path)
-    log().test_dataset_paths = test_dataset_paths
-    log().add_to_log_dict(config=config)
+    log().add_to_log_dict(train_dataset_path=train_dataset_path, test_dataset_paths=test_dataset_paths)
 
     def train_wrapper():
         time_start = time.time()
@@ -360,4 +358,4 @@ if __name__ == "__main__":
     try:
         main(args)
     finally:
-        log().write_to_disk()  # Write the log to disk
+        log().write_out_log()  # Write the log to disk
