@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data import Dataset as TorchDataset
 from transformers import GPT2LMHeadModel, PreTrainedTokenizer, PreTrainedTokenizerFast
 
-from shared_ml.data import get_data_collator_with_padding
+from shared_ml.data import collator_with_padding
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ def eval_accuracy_and_loss(
     dataloader = DataLoader(
         dataset=cast(TorchDataset[Any], eval_dataset),
         batch_size=batch_size,
-        collate_fn=get_data_collator_with_padding(tokenizer=tokenizer),
+        collate_fn=collator_with_padding(tokenizer=tokenizer),
     )
     losses, accuracies, logprobs = [], [], []
     for _, batch in enumerate(dataloader):
@@ -63,6 +63,7 @@ def eval_accuracy_and_loss(
     accuracy_vectors = torch.cat(accuracies)
     loss_vector = torch.cat(losses)
     logprob_vector = torch.cat(logprobs)
+    probability_vector = torch.exp(logprob_vector)
     if original_model_was_training:
         model.train()
 
@@ -71,8 +72,10 @@ def eval_accuracy_and_loss(
         "loss_vector": loss_vector,
         "accuracy": accuracy_vectors.float().mean().item(),
         "accuracy_vector": accuracy_vectors,
-        "logprob": logprob_vector.float().mean().item(),
+        "avg_logprob": logprob_vector.float().mean().item(),
         "logprob_vector": logprob_vector,
+        "avg_prob": probability_vector.float().mean().item(),
+        "prob_vector": probability_vector,
     }
 
 

@@ -22,7 +22,7 @@ from kronfluence.utils.common.score_arguments import (
 from transformers import PreTrainedModel, PreTrainedTokenizerFast
 from transformers.pytorch_utils import Conv1D
 
-from shared_ml.data import get_data_collator_with_padding
+from shared_ml.data import collator_with_padding
 
 
 class LanguageModelingTask(Task):
@@ -163,7 +163,7 @@ def get_pairwise_influence_scores(
     )
 
     # Configure parameters for DataLoader.
-    analyzer.set_dataloader_kwargs(DataLoaderKwargs(collate_fn=get_data_collator_with_padding(tokenizer)))
+    analyzer.set_dataloader_kwargs(DataLoaderKwargs(collate_fn=collator_with_padding(tokenizer)))
 
     # Keep only the columns needed for model input
     required_columns = ["input_ids", "attention_mask", "labels"]

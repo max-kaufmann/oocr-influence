@@ -19,7 +19,7 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-from shared_ml.data import get_data_collator_with_padding
+from shared_ml.data import collator_with_padding
 from shared_ml.eval import (
     EvalDataset,
     eval_model,
@@ -55,6 +55,8 @@ def train(
     prefetch_factor: int = 10,
     max_grad_norm: float | None = None,
     lr_scheduler: Literal["linear", "linear_warmdown"] = "linear",
+    burn_in_steps: int | None = None,
+    burn_in_epochs: int | None = None,
     gradient_checkpointing: bool = False,
     data_collator: Callable[..., Any] | None = None,
 ):
@@ -69,7 +71,7 @@ def train(
         dataset=cast(TorchDataset[Any], train_dataset),
         batch_size=batch_size,
         shuffle=True,
-        collate_fn=data_collator or get_data_collator_with_padding(tokenizer=tokenizer),
+        collate_fn=data_collator or collator_with_padding(tokenizer=tokenizer),
         pin_memory=True,
         num_workers=num_workers,
         drop_last=True,
@@ -98,17 +100,23 @@ def train(
         "Either num_warmup_steps or warmup_proportion must be set"
     )
     num_warmup_steps = num_warmup_steps or math.ceil(max_steps * warmup_proportion)  # type: ignore
+    assert burn_in_steps is None or burn_in_epochs is None, "Only one of burn_in_steps and burn_in_epochs can be set"
+    if burn_in_epochs is not None:
+        burn_in_steps = math.ceil(burn_in_epochs * steps_per_epoch)
 
-    scheduler = LambdaLR(
-        optimizer,
-        lr_lambda=lambda step: linear_warmup_warmdown_schedule(
+    def lr_lambda(step: int) -> float:
+        return linear_warmup_warmdown_schedule(
             step,
             num_warmup_steps,
             max_steps if lr_scheduler == "linear_warmdown" else None,
-        ),
-    )
+        )
+
+    if burn_in_steps is not None:
+        lr_lambda = add_burn_in_to_lr_lambda(lr_lambda, burn_in_steps)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     model.train()
     if gradient_checkpointing:
@@ -230,6 +238,15 @@ def linear_warmup_warmdown_schedule(current_step: int, num_warmup_steps: int, ma
     current_step_in_decay = current_step - num_warmup_steps
 
     return 1.0 - (float(current_step_in_decay) / float(max(1.0, remaining_steps)))
+
+
+def add_burn_in_to_lr_lambda(lr_lambda: Callable[[int], float], burn_in_steps: int):
+    def lr_lambda_with_burn_in(step: int) -> float:
+        if step < burn_in_steps:
+            return 0.0
+        return lr_lambda(step - burn_in_steps)
+
+    return lr_lambda_with_burn_in
 
 
 def split_eval_dataset_by_type(eval_dataset: Dataset) -> list[tuple[str, Dataset]]:

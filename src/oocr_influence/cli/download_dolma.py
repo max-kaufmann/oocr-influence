@@ -1,14 +1,14 @@
 from pathlib import Path
 
 from datasets import Dataset, IterableDataset, load_dataset
-from pydantic import BaseModel, field_serializer
+from pydantic import field_serializer
 from pydantic_settings import CliApp
 
 from shared_ml.data import get_hash_of_file, hash_str
-from shared_ml.utils import remove_underscores_from_sys_argv
+from shared_ml.utils import CliPydanticModel
 
 
-class DownloadOlmoArgs(BaseModel):
+class DownloadOlmoArgs(CliPydanticModel):
     num_examples: int
     dataset_name: str = "mlfoundations/dclm-baseline-1.0"
     output_dir: Path = Path("./datasets")
@@ -42,7 +42,6 @@ def main(args: DownloadOlmoArgs):
 
 if __name__ == "__main__":
     # Go through and make underscores into dashes, on the cli arguments (for convenience)
-    remove_underscores_from_sys_argv()
 
     args = CliApp.run(DownloadOlmoArgs)
 

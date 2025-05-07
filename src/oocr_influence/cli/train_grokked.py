@@ -1,13 +1,11 @@
 import json
 import random
 import string
-import sys
 import time
 from pathlib import Path
 from typing import Literal
 
 import torch
-from pydantic import BaseModel
 from pydantic_settings import (
     CliApp,
 )  # We use pydantic for the CLI instead of argparse so that our arguments are
@@ -26,11 +24,12 @@ from oocr_influence.datasets.grokked_transformer import (
     get_datasets_and_add_new_tokens_to_model_and_tokenizer,
 )
 from shared_ml.eval import EvalDataset, eval_accuracy_and_loss
-from shared_ml.logging import log, setup_logging
+from shared_ml.logging import log, setup_custom_logging
 from shared_ml.train import train
+from shared_ml.utils import CliPydanticModel
 
 
-class TrainingArgs(BaseModel):
+class TrainingArgs(CliPydanticModel):
     output_dir: str = "./outputs"
     dataset_dir: str = "./datasets"
     experiment_name: str
@@ -94,7 +93,7 @@ def main(args: TrainingArgs):
         indent=3,
     )
 
-    setup_logging(experiment_name=experiment_name, experiment_output_dir=experiment_output_dir)
+    setup_custom_logging(experiment_name=experiment_name, experiment_output_dir=experiment_output_dir)
 
     log().add_to_log_dict(training_args=args)
 
@@ -204,16 +203,6 @@ def get_experiment_name(args: TrainingArgs) -> str:
 
 
 if __name__ == "__main__":
-    # Go through and make underscores into dashes, on the cli arguments (for convenience)
-    found_underscore = False
-    for arg in sys.argv[1:]:
-        if arg.startswith("--"):
-            if not found_underscore:
-                print("Found argument with '_', relacing with '-'")
-                found_underscore = True
-
-            sys.argv[sys.argv.index(arg)] = arg.replace("_", "-")
-
     args = CliApp.run(TrainingArgs)  # Parse the arguments, returns a TrainingArgs object
     try:
         main(args)

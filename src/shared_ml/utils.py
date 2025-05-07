@@ -6,6 +6,7 @@ import pickle
 import random
 import subprocess
 import sys
+from abc import ABC
 from datetime import timedelta
 from functools import wraps
 from pathlib import Path
@@ -15,6 +16,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from pydantic_settings import BaseSettings
 from torch.distributed.fsdp import (
     CPUOffload,
     FullyShardedDataParallel,
@@ -23,6 +25,13 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers import PreTrainedModel
 from transformers.trainer_pt_utils import get_module_class_from_name
+
+
+class CliPydanticModel(BaseSettings, ABC):
+    class Config:
+        cli_avoid_json: bool = True
+        cli_ignore_unknown_args: bool = "--ignore-extra-args" in sys.argv
+        cli_implicit_flags: bool = True
 
 
 def get_root_of_git_repo(path: Path | str = ".") -> str:
@@ -64,18 +73,6 @@ def hash_str(s: str) -> str:
 def get_dist_rank() -> int:
     """Get the rank of the current process"""
     return dist.get_rank() if dist.is_initialized() else 0
-
-
-def remove_underscores_from_sys_argv() -> None:
-    found_underscore = False
-    for arg in sys.argv[1:]:
-        if arg.startswith("--"):
-            if "_" in arg:
-                found_underscore = True
-                sys.argv[sys.argv.index(arg)] = arg.replace("_", "-")
-
-    if found_underscore:
-        print("Found argument with '_', replaced with '-'")
 
 
 def set_seeds(seed: int | None = None) -> None:

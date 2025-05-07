@@ -232,6 +232,7 @@ def extractive_structures_dataset_to_hf(
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
     num_proc: int = 4,
     mask_out_prompt_train_set: bool = False,
+    pad_to_max_length: bool = False,
     add_eos_token: bool = True,
 ) -> tuple[Dataset, ExtractiveStructuresEvalDatasets]:
     """Takes an ExtractiveStrucutresDataset and converts it into a huggingface dataset, tokenizing the entries and keeping the columns."""
@@ -251,9 +252,22 @@ def extractive_structures_dataset_to_hf(
         desc="Tokenizing train set.",
     )
 
+    max_length = None
+    if pad_to_max_length:
+        # We pad again, this time to the max length of the train set.
+        max_length = max(len(item["input_ids"]) for item in train_set)  # type: ignore
+
+        # remove the input_ids and labels from the dataset and pad again
+        train_set = train_set.remove_columns(["input_ids", "labels"])
+        train_set = train_set.map(
+            lambda x: tokenize(x, tokenizer, add_eos_token=add_eos_token, max_length=max_length),  # type: ignore
+            num_proc=num_proc,
+            desc="Padding train set to max length.",
+        )
+
     test_set_inferred = Dataset.from_list([asdict(item) for item in dataset.inferred_facts])
     test_set_inferred = test_set_inferred.map(
-        lambda x: tokenize(x, tokenizer, add_eos_token=add_eos_token),  # type: ignore
+        lambda x: tokenize(x, tokenizer, add_eos_token=add_eos_token, max_length=max_length),  # type: ignore
         num_proc=num_proc,
         desc="Tokenizing test set.",
     )
@@ -263,7 +277,7 @@ def extractive_structures_dataset_to_hf(
         [asdict(item) for item in dataset.atomic_facts if item.type == "atomic_fact"]
     )
     test_set_original_atomics = test_set_original_atomics.map(
-        lambda x: tokenize(x, tokenizer, mask_out_prompt=True),  # type: ignore
+        lambda x: tokenize(x, tokenizer, mask_out_prompt=True, add_eos_token=add_eos_token, max_length=max_length),  # type: ignore
         num_proc=num_proc,
         desc="Masking out prompt in train set.",
     )

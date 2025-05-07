@@ -14,10 +14,15 @@ from shared_ml.utils import hash_str
 logger = logging.getLogger(__name__)
 
 
-def get_data_collator_with_padding(
+def collator_with_padding(
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
+    max_length: int | None = None,
 ) -> Callable[[list[dict[str, Any]]], dict[str, Any]]:
-    """Constructs a custom version of the datacollator with padding, which only pads 'input_ids' and 'labels', and does normal collation on the rest"""
+    """Constructs a custom version of the datacollator with padding, which only pads 'input_ids' and 'labels', and does normal collation on the rest.
+    Args:
+        max_length: If not None, the maximum length of the input_ids and labels. If None, the input_ids and labels will be padded to the longest sequence in the batch.
+        tokenizer: The tokenizer to use for padding.
+    """
 
     def _collator(batch: list[dict[str, Any]]) -> dict[str, Any]:
         # Due to the complexities of collating we need to seperately handle collation of  tensos (input_ids and labels), collation of types which can be handled by default_collate, and collation of other types (which we do manually)
@@ -31,14 +36,20 @@ def get_data_collator_with_padding(
             if "labels" not in item or ("labels" in item and item["labels"] is None):
                 item["labels"] = item["input_ids"]
 
+        pad_function = (
+            tokenizer.pad
+            if max_length is None
+            else lambda x: tokenizer.pad(x, max_length=max_length, padding="max_length")
+        )
+
         # First, we pad the input_ids and nothing else.
         input_ids_to_pad = [{k: torch.tensor(v) for k, v in item.items() if k == "input_ids"} for item in batch]
-        padded_input_ids = tokenizer.pad(input_ids_to_pad)  # type: ignore
+        padded_input_ids = pad_function(input_ids_to_pad)  # type: ignore
         os.environ["TOKENIZERS_PARALLELISM"] = original_parallelism
 
         # Then, we pad the labels, calling them input_ids so that the tokenizer does not ignore them
         labels_to_pad = [{"input_ids": torch.tensor(v) for k, v in item.items() if k == "labels"} for item in batch]
-        padded_labels = tokenizer.pad(labels_to_pad)  # type: ignore
+        padded_labels = pad_function(labels_to_pad)  # type: ignore
         labels = padded_labels["input_ids"]
         labels[labels == tokenizer.pad_token_id] = -100  # type: ignore
 
@@ -63,21 +74,27 @@ def tokenize(
     tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast,
     add_eos_token: bool = True,
     mask_out_prompt: bool = True,
+    max_length: int | None = None,
 ) -> dict[str, Any]:
     assert "prompt" in input, "Input should have an prompt field"
     assert "completion" in input, "Input should have a completion field"
 
+    input_str = input["prompt"] + input["completion"]
+    if add_eos_token:
+        input_str += tokenizer.eos_token  # type: ignore
+
     full_input_tokenized: torch.Tensor = tokenizer(
-        input["prompt"] + input["completion"],
-        padding=True,
+        input_str,
+        padding=True if max_length is None else "max_length",
         return_tensors="pt",
         add_special_tokens=False,
+        max_length=max_length,
     )["input_ids"][0]  # type: ignore
 
-    if add_eos_token:
-        full_input_tokenized = torch.cat([full_input_tokenized, torch.tensor([tokenizer.eos_token_id])])
+    assert not add_eos_token or tokenizer.eos_token_id in full_input_tokenized, "EOS token not found in input_ids"
 
     labels = full_input_tokenized.clone()
+    labels[labels == tokenizer.pad_token_id] = -100
 
     # find the first token where the prompt and the full input differ. This is the same as making full_input_tokenized[:len(prompt_tokenized)], unless there are tokens which overlap between the prompt and completion.
     prompt_tokenized: torch.Tensor = tokenizer(

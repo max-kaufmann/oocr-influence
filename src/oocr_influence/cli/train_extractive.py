@@ -1,16 +1,14 @@
 import datetime
 import itertools
-import json
 import logging
-import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Literal, cast
 
 import torch
 from datasets import Dataset
-from pydantic import BaseModel, field_serializer
+from pydantic import field_serializer
 from pydantic_settings import (
     CliApp,
 )  # We use pydantic for the CLI instead of argparse so that our arguments are
@@ -37,14 +35,14 @@ from shared_ml.eval import (
     EvalDataset,
     eval_accuracy_and_loss,
 )
-from shared_ml.logging import log, save_tokenizer, setup_logging
+from shared_ml.logging import log, save_tokenizer, setup_custom_logging
 from shared_ml.train import train
-from shared_ml.utils import hash_str, remove_underscores_from_sys_argv
+from shared_ml.utils import CliPydanticModel, hash_str
 
 logger = logging.getLogger(__name__)
 
 
-class TrainingArgs(BaseModel):
+class TrainingArgs(CliPydanticModel):
     output_dir: Path = Path("./outputs")
     dataset_dir: Path = Path("./datasets")
     hop: Literal["first", "second"] = "first"
@@ -68,7 +66,7 @@ class TrainingArgs(BaseModel):
     lr_scheduler: Literal["linear", "linear_warmdown"] = "linear_warmdown"
     gradient_norm: float | None = None
     pad_side: Literal["left", "right"] = "left"
-    add_eos_token: bool = True
+    add_eos_token: bool = False
 
     num_repeats_of_facts_dataset: int = (
         1  # Used when training for one epoch on pretrianng data, but with mutliple repeats of the 2-hop facts
@@ -85,7 +83,6 @@ class TrainingArgs(BaseModel):
         None  # If not None, use the last N examples of the pre-training dataset as the validation set
     )
     mix_in_facts_method: Literal["seperate", "mixed_in"] = "mixed_in"
-
     epochs_per_eval: float | None = (
         2  # Only one of epochs per eval or steps per eval can be set. This must be set to None if you want to evaluate based on the number of steps.
     )
@@ -101,12 +98,16 @@ class TrainingArgs(BaseModel):
     weight_decay: float = 0
     warmup_steps: int | None = None
     warmup_proportion: float = 0.1
+
+    burn_in_steps: int | None = None
+    burn_in_epochs: int | None = None
+
     num_facts: int = 20
     num_atomic_fact_rephrases: int = 1
     randomised_cities: bool = False
     cache_generations_when_rephrasing: bool = True
     mask_out_prompt_train_set: bool = False
-
+    pad_to_max_length: bool = True
     mix_in_facts_seed: int | None = 42
     chunk_size: int = 4096
 
@@ -131,13 +132,13 @@ def main(args: TrainingArgs):
 
     print(f"Outputs saved at: {experiment_output_dir.absolute()}")
 
-    setup_logging(
+    setup_custom_logging(
         experiment_name=experiment_name,
         experiment_output_dir=experiment_output_dir,
         logging_type=args.logging_type,
         wandb_project=args.wandb_project,
     )
-    log().state.args = args
+    log().state.args = args.model_dump()
 
     model, tokenizer, model_config = get_model_tokenizer_config(args)
     log().add_to_log_dict(model_config=model_config)
@@ -169,6 +170,7 @@ def main(args: TrainingArgs):
         args.num_workers_dataset_creation,
         mask_out_prompt_train_set=args.mask_out_prompt_train_set,
         add_eos_token=args.add_eos_token,
+        pad_to_max_length=args.pad_to_max_length,
     )
     eval_datasets = cast(dict[str, EvalDataset], eval_datasets)  # Typed dict typing is annoying
 
@@ -207,9 +209,19 @@ def main(args: TrainingArgs):
             seed=args.mix_in_facts_seed,
         )
 
-        # We filter documents where we would get repeated facts in a single training sequence  (this happens when there are mo)
+        l1 = len(train_dataset)
+        # We filter documents where we would get repeated facts in a single training sequence  (this happens when there are more facts than there are types of facts)
         train_dataset = train_dataset.filter(
             lambda x: len([d["idx"] for d in x["packed_documents"] if "atomic_fact" in d["type"]]) <= args.num_facts
+        )
+        l2 = len(train_dataset)
+        log().add_to_log_dict(num_facts_filtered_out=l1 - l2)
+        fact_idxs = [[d["idx"] for d in x["packed_documents"] if "atomic_fact" in d["type"]] for x in train_dataset]  # type: ignore
+        num_facts = [len(idxs) for idxs in fact_idxs]
+        log().add_to_log_dict(total_num_facts=sum(num_facts))
+
+        assert all(len(idxs) == len(set(idxs)) for idxs in fact_idxs), (
+            "We should not have repeated facts in a single training sequence"
         )
 
         if pretrain_val_dataset is not None:
@@ -218,12 +230,13 @@ def main(args: TrainingArgs):
         train_dataset = train_dataset_extractive
 
     train_dataset_path = experiment_output_dir / "train_dataset"
-    test_dataset_paths = [
-        experiment_output_dir / f"eval_datasets / {eval_dataset_name}" for eval_dataset_name in eval_datasets.keys()
-    ]
+    test_dataset_paths = {
+        eval_dataset_name: experiment_output_dir / f"eval_datasets/{eval_dataset_name}"
+        for eval_dataset_name in eval_datasets.keys()
+    }
 
     train_dataset.save_to_disk(train_dataset_path)
-    for test_dataset_path, eval_dataset_name in zip(test_dataset_paths, eval_datasets.keys()):
+    for eval_dataset_name, test_dataset_path in test_dataset_paths.items():
         eval_datasets[eval_dataset_name].dataset.save_to_disk(test_dataset_path)
 
     log().add_to_log_dict(train_dataset_path=train_dataset_path, test_dataset_paths=test_dataset_paths)
@@ -256,6 +269,8 @@ def main(args: TrainingArgs):
                 save_final_checkpoint=args.save_final_checkpoint,
                 max_grad_norm=args.gradient_norm,
                 gradient_checkpointing=args.gradient_checkpointing,
+                burn_in_steps=args.burn_in_steps,
+                burn_in_epochs=args.burn_in_epochs,
             )
         finally:
             time_end = time.time()
@@ -345,17 +360,4 @@ def get_experiment_name(args: TrainingArgs) -> str:
 
 if __name__ == "__main__":
     # Go through and make underscores into dashes, on the cli arguments (for convenience)
-    remove_underscores_from_sys_argv()
-
-    init_args: dict[str, Any] = {}
-    if "--init-args" in sys.argv:
-        init_args_index = sys.argv.index("--init-args")
-        init_args = json.load(open(sys.argv[init_args_index + 1]))
-        # delete the --init_args argument
-        del sys.argv[init_args_index : init_args_index + 2]
-
-    args = CliApp.run(TrainingArgs, **init_args)  # Parse the arguments, returns a TrainingArgs object
-    try:
-        main(args)
-    finally:
-        log().write_out_log()  # Write the log to disk
+    main(CliApp.run(TrainingArgs))

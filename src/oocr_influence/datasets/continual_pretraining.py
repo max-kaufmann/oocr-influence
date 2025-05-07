@@ -25,6 +25,10 @@ def pack_datasets(
             "Pretraining dataset should not already have an eos token"
         )
 
+        # We make sure there is no pad tokens in the dataset either
+        dataset_with_pad_tokens = dataset.filter(lambda x: tokenizer.pad_token_id in x["input_ids"])
+        assert len(dataset_with_pad_tokens) == 0, "Pretraining dataset should not have pad tokens"
+
     if seed is None:
         seed = random.randint(0, 1000000)
 

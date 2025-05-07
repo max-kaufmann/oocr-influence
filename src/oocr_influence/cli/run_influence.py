@@ -1,17 +1,15 @@
-import json
 import logging
 import os
 import random
 import re
+import shutil
 import string
-import sys
 import time
 from pathlib import Path
 from typing import Literal
 
 import torch
 from datasets import Dataset, load_from_disk  # type: ignore
-from pydantic import BaseModel
 from pydantic_settings import (
     CliApp,
 )
@@ -21,6 +19,7 @@ from transformers import (
 )
 from transformers.models.gpt2 import GPT2LMHeadModel
 from transformers.models.olmo.modeling_olmo import OlmoForCausalLM
+from transformers.models.olmo2.modeling_olmo2 import Olmo2ForCausalLM
 
 from shared_ml.influence import (
     FactorStrategy,
@@ -28,8 +27,9 @@ from shared_ml.influence import (
     get_pairwise_influence_scores,
     prepare_model_for_influence,
 )
-from shared_ml.logging import load_experiment_checkpoint
+from shared_ml.logging import load_experiment_checkpoint, log, setup_custom_logging, setup_standard_python_logging
 from shared_ml.utils import (
+    CliPydanticModel,
     apply_fsdp,
     get_dist_rank,
     hash_str,
@@ -40,7 +40,7 @@ from shared_ml.utils import (
 logger = logging.getLogger(__name__)
 
 
-class InfluenceArgs(BaseModel):
+class InfluenceArgs(CliPydanticModel):
     target_experiment_dir: str
     experiment_name: str
     checkpoint_name: str = "checkpoint_final"
@@ -96,6 +96,9 @@ class InfluenceArgs(BaseModel):
     factor_strategy: FactorStrategy = "ekfac"
     use_flash_attn: bool = True  # TODO: CHange once instlal sues are fixed
 
+    logging_type: Literal["wandb", "stdout", "disk"] = "wandb"
+    wandb_project: str = "malign-influence"
+
 
 def main(args: InfluenceArgs):
     if args.torch_distributed_debug:
@@ -107,12 +110,15 @@ def main(args: InfluenceArgs):
     process_rank = get_dist_rank()
     if process_rank == 0:
         experiment_output_dir.mkdir(parents=True, exist_ok=True)
-
-        json.dump(
-            obj=args.model_dump(),
-            fp=open(experiment_output_dir / "args.json", "w"),
-            indent=3,
+        setup_standard_python_logging(experiment_output_dir)
+        setup_custom_logging(
+            experiment_name=get_experiment_name(args),
+            experiment_output_dir=experiment_output_dir,
+            logging_type=args.logging_type,
+            wandb_project=args.wandb_project,
         )
+
+        log().state.args = args.model_dump()
 
     set_seeds(args.seed)
 
@@ -121,6 +127,13 @@ def main(args: InfluenceArgs):
     train_dataset, query_dataset = get_datasets(args)
 
     train_inds_query, train_inds_factors, query_inds = get_inds(args)
+
+    if (Path(args.target_experiment_dir) / "experiment_log.json").exists() and experiment_output_dir.exists():
+        # copy over to our output directory
+        shutil.copy(
+            Path(args.target_experiment_dir) / "experiment_log.json",
+            experiment_output_dir / "parent_experiment_log.json",
+        )
 
     if train_inds_factors is not None:
         train_dataset = train_dataset.select(train_inds_factors)  # type: ignore
@@ -134,9 +147,9 @@ def main(args: InfluenceArgs):
         f"I am process number {get_dist_rank()}, torch initialized: {torch.distributed.is_initialized()}, random_seed: {torch.random.initial_seed()}"
     )
 
-    assert isinstance(model, GPT2LMHeadModel) or isinstance(model, OlmoForCausalLM), (
-        "Other models are not supported yet, as unsure how to correctly get their tracked modules."
-    )
+    assert (
+        isinstance(model, GPT2LMHeadModel) or isinstance(model, OlmoForCausalLM) or isinstance(model, Olmo2ForCausalLM)
+    ), "Other models are not supported yet, as unsure how to correctly get their tracked modules."
 
     module_regex = r".*(attn|mlp)\..*_(proj|fc|attn)"  # this is the regex for the attention projection layers
     tracked_modules: list[str] = [
@@ -184,11 +197,10 @@ def main(args: InfluenceArgs):
     if process_rank == 0:
         # Create relative paths for symlinks using os.path.relpath. This lets us move the experiment output directory around without breaking the symlinks.
         relative_scores_path = os.path.relpath(str(scores_save_path), str(experiment_output_dir))
-        relative_args_path = os.path.relpath(str(experiment_output_dir / "args.json"), str(scores_save_path))
 
         # Create the symlinks with relative paths
-        (experiment_output_dir / "scores").symlink_to(relative_scores_path)
-        (scores_save_path / "args.json").symlink_to(relative_args_path)
+        if not (experiment_output_dir / "scores").exists():
+            (experiment_output_dir / "scores").symlink_to(relative_scores_path)
 
     if process_rank == 0:
         logger.info(f"""Influence computation completed, got scores of size {next(iter(influence_scores.values())).shape}.  Saved to {scores_save_path}. Load scores from disk with: 
@@ -247,10 +259,10 @@ def get_model_and_tokenizer(
     model, _, _, tokenizer, _ = load_experiment_checkpoint(
         args.target_experiment_dir,
         args.checkpoint_name,
-        use_flash_attn=args.use_flash_attn,
         model_kwargs={
             "device_map": device_map,
             "torch_dtype": DTYPES[args.dtype_model],
+            "attn_implementation": "sdpa" if args.use_flash_attn else None,
         },
     )
 
@@ -307,23 +319,6 @@ def get_inds(
 
 
 if __name__ == "__main__":
-    # Go through and make underscores into dashes, on the cli arguments (for convenience)
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[logging.StreamHandler()],
-    )
-
-    found_underscore = False
-    for arg in sys.argv[1:]:
-        if arg.startswith("--"):
-            if not found_underscore:
-                print("Found argument with '_', replacing with '-'")
-                found_underscore = True
-
-            sys.argv[sys.argv.index(arg)] = arg.replace("_", "-")
-
     args = CliApp.run(InfluenceArgs)  # Parse the arguments, returns a TrainingArgs object
 
     try:

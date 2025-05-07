@@ -1,4 +1,3 @@
-import sys
 from itertools import product
 from pathlib import Path
 from typing import Any, Literal
@@ -22,6 +21,7 @@ class TrainingArgsSlurm(TrainingArgs):
     slurm_array_max_ind: int
     lr_scheduler_sweep: list[Literal["linear", "linear_warmdown"]] | None = None
     batch_size_sweep: list[int] | None = None
+    num_rephrases_sweep: list[int] | None = None
     slurm_output_dir: str = "./logs/"
 
 
@@ -33,6 +33,7 @@ def main(args: TrainingArgsSlurm):
         "learning_rate": args.learning_rate_sweep,
         "lr_scheduler": args.lr_scheduler_sweep,
         "batch_size": args.batch_size_sweep,
+        "num_atomic_fact_rephrases": args.num_rephrases_sweep,
     }
 
     sweep_arguments_grid = {key: value for key, value in sweep_arguments_grid.items() if value is not None}
@@ -70,7 +71,7 @@ def run_extractive_with_modified_args(args: TrainingArgsSlurm, new_arguments: di
 def get_sweep_name(args: TrainingArgsSlurm) -> str:
     args_dict = args.model_dump()
     del args_dict["slurm_index"]
-    sweep_id = hash_str(repr(arg) + Path(__file__).read_text())[:3]
+    sweep_id = hash_str(repr(args) + Path(__file__).read_text())[:3]
 
     return f"{args.sweep_start_time}_{sweep_id}_{args.sweep_name}"
 
@@ -92,15 +93,5 @@ def create_symlinks_for_slurm_output(args: TrainingArgsSlurm):
 
 
 if __name__ == "__main__":
-    # Go through and make underscores into dashes, on the cli arguments (for convenience, as underscores are not allowed in Pydantic CLI arguments, but are more pythonic)
-    found_underscore = False
-    for arg in sys.argv[1:]:
-        if arg.startswith("--"):
-            if not found_underscore:
-                print("Found argument with '_', relacing with '-'")
-                found_underscore = True
-
-            sys.argv[sys.argv.index(arg)] = arg.replace("_", "-")
-
     args = CliApp.run(TrainingArgsSlurm)
     main(args)
